@@ -1,0 +1,75 @@
+name: Build Unsigned IPA Xcode15 Downgraded
+
+on:
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    steps:
+      - name: Select Xcode 15.4
+        run: sudo xcode-select -switch /Applications/Xcode_15.4.app
+
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Patch project spec for Xcode 15.4
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('project.yml')
+          text = path.read_text()
+          marker = '  minimumXcodeGenVersion: 2.38.0\n'
+          if '  xcodeVersion: "15.4"\n' not in text:
+              text = text.replace(marker, marker + '  xcodeVersion: "15.4"\n')
+          path.write_text(text)
+          PY
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate project
+        run: xcodegen generate
+
+      - name: Downgrade project objectVersion for Xcode 15.4
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          pbxproj = Path('MentalismApp.xcodeproj/project.pbxproj')
+          text = pbxproj.read_text()
+          text = text.replace('objectVersion = 77;', 'objectVersion = 60;')
+          pbxproj.write_text(text)
+          print('Patched objectVersion to 60')
+          PY
+
+      - name: Build iPhone app without signing
+        run: |
+          xcodebuild \
+            -project MentalismApp.xcodeproj \
+            -scheme MentalismApp \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package unsigned IPA
+        run: bash scripts/package_unsigned_ipa.sh MentalismApp DerivedData/Build/Products/Release-iphoneos/MentalismApp.app artifacts
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mentalismapp-unsigned-ipa
+          path: |
+            artifacts/MentalismApp-unsigned.ipa
+            DerivedData/Build/Products/Release-iphoneos/MentalismApp.app
