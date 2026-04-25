@@ -1,0 +1,66 @@
+name: MentalismApp
+options:
+  minimumXcodeGenVersion: 2.38.0
+  deploymentTarget:
+    iOS: "16.0"
+configs:
+  Debug: debug
+  Release: release
+packages:
+  MentalismCore:
+    path: .
+targets:
+  MentalismApp:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - path: MentalismApp
+        excludes:
+          - Info.plist
+    dependencies:
+      - package: MentalismCore
+        product: MentalismCore
+    info:
+      path: MentalismApp/Info.plist
+      properties:
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.mentalismapp
+        PRODUCT_NAME: MentalismApp
+        SWIFT_VERSION: 5.9
+        TARGETED_DEVICE_FAMILY: 1
+        CODE_SIGN_STYLE: Automatic
+        GENERATE_INFOPLIST_FILE: NO
+        DEVELOPMENT_TEAM: ""
+  MentalismAppTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - MentalismAppTests
+    dependencies:
+      - target: MentalismApp
+      - package: MentalismCore
+        product: MentalismCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.mentalismapp.tests
+        SWIFT_VERSION: 5.9
+  MentalismAppUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - MentalismAppUITests
+    dependencies:
+      - target: MentalismApp
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.mentalismapp.uitests
+        SWIFT_VERSION: 5.9
