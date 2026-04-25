@@ -1,0 +1,635 @@
+name: Build Unsigned IPA Effect Patched
+
+on:
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    steps:
+      - name: Select Xcode 15.4
+        run: sudo xcode-select -switch /Applications/Xcode_15.4.app
+
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Patch project spec for Xcode 15.4
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('project.yml')
+          text = path.read_text()
+          marker = '  minimumXcodeGenVersion: 2.38.0\n'
+          if '  xcodeVersion: "15.4"\n' not in text:
+              text = text.replace(marker, marker + '  xcodeVersion: "15.4"\n')
+          path.write_text(text)
+          PY
+
+      - name: Patch model declarations for Xcode 15.4
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('Sources/MentalismCore/Models/TrickTypes.swift')
+          text = path.read_text()
+          text = text.replace('public struct SecretInputSpec: Codable, Equatable, Sendable {', 'public struct SecretInputSpec: Equatable, Sendable {')
+          text = text.replace('public struct TrickDefinition: Codable, Equatable, Sendable, Identifiable {', 'public struct TrickDefinition: Equatable, Sendable, Identifiable {')
+          text = text.replace('public struct ActiveTrickSession: Codable, Equatable, Sendable {', 'public struct ActiveTrickSession: Equatable, Sendable {')
+          text = text.replace('public struct PrivacyPolicyState: Codable, Equatable, Sendable {', 'public struct PrivacyPolicyState: Equatable, Sendable {')
+          path.write_text(text)
+          PY
+
+      - name: Patch iPhone effect source files
+        run: |
+          cat > MentalismApp/AppModel.swift <<'EOF'
+          import SwiftUI
+          import MentalismCore
+          import UIKit
+          
+          @MainActor
+          final class AppModel: ObservableObject {
+              enum Route: Equatable {
+                  case home
+                  case spectatorInput
+                  case unlocked
+              }
+          
+              @Published var route: Route = .home
+              @Published var digitCount: Int = 4
+              @Published var selectedRevealMode: RevealMode = .audio
+              @Published var performerMessage: String = "Choose the digit length, then hand the phone over."
+              @Published var shouldHideForPrivacy = false
+              @Published var unlockAttemptTarget: Int = 2
+              @Published var currentAttempt: Int = 0
+              @Published var wrongPasscodeMessage: String?
+              @Published var wallpaperImage: UIImage?
+          
+              private let store = TrickSessionStore()
+              private lazy var audioService = AudioRevealService()
+              private lazy var engine = PasscodePeekEngine(
+                  store: store,
+                  router: DefaultRevealRouter(performers: [audioService])
+              )
+              private lazy var resetService = DefaultResetService(store: store)
+              private let wallpaperKey = "customWallpaperJPEGData"
+          
+              init() {
+                  if let data = UserDefaults.standard.data(forKey: wallpaperKey),
+                     let image = UIImage(data: data) {
+                      wallpaperImage = image
+                  }
+              }
+          
+              var maskedEntry: String {
+                  engine.maskedSecret
+              }
+          
+              var enteredDigitCount: Int {
+                  store.activeSession?.enteredSecret.count ?? 0
+              }
+          
+              var activeDigitCount: Int {
+                  engine.definition.inputConstraints.digitCount
+              }
+          
+              var isReadyToReveal: Bool {
+                  engine.isReadyToReveal
+              }
+          
+              func beginRoutine() {
+                  _ = engine.startSession(revealMode: selectedRevealMode, digitCount: digitCount)
+                  currentAttempt = 0
+                  wrongPasscodeMessage = nil
+                  performerMessage = "Spectator mode is active."
+                  route = .spectatorInput
+              }
+          
+              func appendDigit(_ digit: Character) {
+                  objectWillChange.send()
+                  engine.appendDigit(digit)
+                  guard isReadyToReveal else { return }
+                  Task { await processCompletedEntry() }
+              }
+          
+              func removeLastDigit() {
+                  objectWillChange.send()
+                  engine.removeLastDigit()
+                  wrongPasscodeMessage = nil
+              }
+          
+              func panicReset() {
+                  resetService.reset()
+                  performerMessage = "Routine reset. No secret retained."
+                  shouldHideForPrivacy = false
+                  wrongPasscodeMessage = nil
+                  currentAttempt = 0
+                  route = .home
+              }
+          
+              func handleScenePhaseChange(_ phase: ScenePhase) {
+                  shouldHideForPrivacy = phase != .active && store.hasActiveSecret
+              }
+          
+              func updateWallpaper(from data: Data?) {
+                  guard let data, let image = UIImage(data: data) else { return }
+                  wallpaperImage = image
+                  let persistedData = image.jpegData(compressionQuality: 0.82) ?? data
+                  UserDefaults.standard.set(persistedData, forKey: wallpaperKey)
+              }
+          
+              func clearWallpaper() {
+                  wallpaperImage = nil
+                  UserDefaults.standard.removeObject(forKey: wallpaperKey)
+              }
+          
+              private func processCompletedEntry() async {
+                  let outcome = await engine.reveal()
+                  switch outcome {
+                  case .delivered:
+                      performerMessage = "Secret delivered through audio."
+                  case .fallback(let message):
+                      performerMessage = message
+                  }
+          
+                  currentAttempt += 1
+                  if currentAttempt >= unlockAttemptTarget {
+                      wrongPasscodeMessage = nil
+                      route = .unlocked
+                      return
+                  }
+          
+                  wrongPasscodeMessage = "Wrong Passcode"
+                  try? await Task.sleep(nanoseconds: 900_000_000)
+                  wrongPasscodeMessage = nil
+                  objectWillChange.send()
+                  _ = engine.startSession(revealMode: selectedRevealMode, digitCount: digitCount)
+              }
+          }
+          EOF
+          
+          cat > MentalismApp/Views/RootView.swift <<'EOF'
+          import SwiftUI
+          
+          struct RootView: View {
+              @AppStorage("privacyPolicyAcceptedVersion") private var acceptedVersion = ""
+              @EnvironmentObject private var appModel: AppModel
+          
+              private let currentPrivacyVersion = "1.0"
+          
+              var body: some View {
+                  Group {
+                      if acceptedVersion != currentPrivacyVersion {
+                          OnboardingView(currentPrivacyVersion: currentPrivacyVersion) {
+                              acceptedVersion = currentPrivacyVersion
+                          }
+                      } else {
+                          switch appModel.route {
+                          case .home:
+                              TrickSelectionView()
+                          case .spectatorInput:
+                              SpectatorEntryView()
+                          case .unlocked:
+                              FauxUnlockedHomeView()
+                          }
+                      }
+                  }
+                  .preferredColorScheme(.dark)
+              }
+          }
+          EOF
+          
+          cat > MentalismApp/Views/TrickSelectionView.swift <<'EOF'
+          import SwiftUI
+          import MentalismCore
+          import PhotosUI
+          
+          struct TrickSelectionView: View {
+              @EnvironmentObject private var appModel: AppModel
+              @State private var selectedWallpaperItem: PhotosPickerItem?
+          
+              var body: some View {
+                  NavigationStack {
+                      ZStack {
+                          LinearGradient(
+                              colors: [Color(red: 0.05, green: 0.08, blue: 0.13), Color(red: 0.16, green: 0.11, blue: 0.06)],
+                              startPoint: .topLeading,
+                              endPoint: .bottomTrailing
+                          )
+                          .ignoresSafeArea()
+          
+                          VStack(spacing: 24) {
+                              VStack(alignment: .leading, spacing: 8) {
+                                  Text("Passcode Peek")
+                                      .font(.largeTitle.bold())
+                                  Text("A premium keypad-based mentalism routine with a custom lock-screen-inspired experience, wrong-passcode shake, and attempt-based unlock.")
+                                      .foregroundStyle(.secondary)
+                              }
+                              .frame(maxWidth: .infinity, alignment: .leading)
+          
+                              settingsCard
+          
+                              VStack(alignment: .leading, spacing: 10) {
+                                  Text("Performer notes")
+                                      .font(.headline)
+                                  Text("Use only with willing spectators. This routine uses a custom in-app screen with your chosen wallpaper and an in-app unlocked destination.")
+                                      .foregroundStyle(.secondary)
+                              }
+                              .frame(maxWidth: .infinity, alignment: .leading)
+          
+                              Spacer()
+          
+                              Button("Start Spectator Mode") {
+                                  appModel.beginRoutine()
+                              }
+                              .buttonStyle(.borderedProminent)
+                              .tint(.orange)
+                              .controlSize(.large)
+                          }
+                          .padding(24)
+                      }
+                  }
+              }
+          
+              private var settingsCard: some View {
+                  VStack(alignment: .leading, spacing: 16) {
+                      Text("Routine setup")
+                          .font(.headline)
+          
+                      Picker("Digits", selection: $appModel.digitCount) {
+                          Text("4-digit").tag(4)
+                          Text("6-digit").tag(6)
+                      }
+                      .pickerStyle(.segmented)
+          
+                      Picker("Reveal mode", selection: $appModel.selectedRevealMode) {
+                          ForEach(RevealMode.allCases) { mode in
+                              Text(mode.displayName).tag(mode)
+                          }
+                      }
+                      .pickerStyle(.segmented)
+                      .disabled(true)
+          
+                      Stepper(
+                          "Unlock on attempt \(appModel.unlockAttemptTarget)",
+                          value: $appModel.unlockAttemptTarget,
+                          in: 1...5
+                      )
+          
+                      HStack(spacing: 12) {
+                          PhotosPicker(selection: $selectedWallpaperItem, matching: .images) {
+                              Label("Choose Wallpaper", systemImage: "photo")
+                          }
+                          .buttonStyle(.bordered)
+          
+                          Button("Clear Wallpaper") {
+                              appModel.clearWallpaper()
+                              selectedWallpaperItem = nil
+                          }
+                          .buttonStyle(.bordered)
+                      }
+          
+                      if appModel.wallpaperImage != nil {
+                          Text("Using your selected wallpaper for the custom locked and unlocked scenes.")
+                              .font(.footnote)
+                              .foregroundStyle(.secondary)
+                      }
+          
+                      Text(appModel.performerMessage)
+                          .foregroundStyle(.secondary)
+                  }
+                  .padding()
+                  .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+                  .task(id: selectedWallpaperItem) {
+                      guard let item = selectedWallpaperItem else { return }
+                      let data = try? await item.loadTransferable(type: Data.self)
+                      appModel.updateWallpaper(from: data)
+                  }
+              }
+          }
+          EOF
+          
+          cat > MentalismApp/Views/SpectatorEntryView.swift <<'EOF'
+          import SwiftUI
+          
+          struct SpectatorEntryView: View {
+              @EnvironmentObject private var appModel: AppModel
+              @State private var showPerformerControls = false
+              @State private var shakeCount = 0
+          
+              private let keypadRows = [
+                  ["1", "2", "3"],
+                  ["4", "5", "6"],
+                  ["7", "8", "9"],
+                  ["", "0", "delete"],
+              ]
+          
+              var body: some View {
+                  ZStack {
+                      spectatorBackground
+          
+                      VStack(spacing: 28) {
+                          topChrome
+          
+                          HStack(spacing: 14) {
+                              ForEach(0..<appModel.activeDigitCount, id: \.self) { index in
+                                  Circle()
+                                      .fill(index < appModel.enteredDigitCount ? Color.white : Color.white.opacity(0.22))
+                                      .frame(width: 16, height: 16)
+                              }
+                          }
+                          .accessibilityIdentifier("digit-indicators")
+                          .modifier(ShakeEffect(animatableData: CGFloat(shakeCount)))
+          
+                          if let message = appModel.wrongPasscodeMessage {
+                              Text(message)
+                                  .font(.headline)
+                                  .foregroundStyle(.white)
+                                  .transition(.opacity)
+                          } else {
+                              Text("Enter Passcode")
+                                  .font(.headline)
+                                  .foregroundStyle(.white.opacity(0.9))
+                          }
+          
+                          VStack(spacing: 14) {
+                              ForEach(keypadRows, id: \.self) { row in
+                                  HStack(spacing: 14) {
+                                      ForEach(row, id: \.self) { key in
+                                          keypadButton(for: key)
+                                      }
+                                  }
+                              }
+                          }
+          
+                          Text("Protected input active")
+                              .font(.footnote)
+                              .foregroundStyle(.white.opacity(0.72))
+          
+                          Text("Attempt \(appModel.currentAttempt + 1) of \(appModel.unlockAttemptTarget)")
+                              .font(.footnote)
+                              .foregroundStyle(.white.opacity(0.58))
+                      }
+                      .padding(24)
+                  }
+                  .onChange(of: appModel.wrongPasscodeMessage) { message in
+                      guard message != nil else { return }
+                      withAnimation(.easeInOut(duration: 0.32)) {
+                          shakeCount += 1
+                      }
+                  }
+                  .confirmationDialog("Performer Controls", isPresented: $showPerformerControls, titleVisibility: .visible) {
+                      Button("Panic Reset", role: .destructive) {
+                          appModel.panicReset()
+                      }
+                  } message: {
+                      Text("Reset immediately and clear the active routine.")
+                  }
+              }
+          
+              private var spectatorBackground: some View {
+                  ZStack {
+                      if let uiImage = appModel.wallpaperImage {
+                          Image(uiImage: uiImage)
+                              .resizable()
+                              .scaledToFill()
+                              .ignoresSafeArea()
+                      } else {
+                          LinearGradient(
+                              colors: [Color(red: 0.07, green: 0.12, blue: 0.22), Color(red: 0.14, green: 0.10, blue: 0.16)],
+                              startPoint: .top,
+                              endPoint: .bottom
+                          )
+                          .ignoresSafeArea()
+                      }
+          
+                      Rectangle()
+                          .fill(
+                              LinearGradient(
+                                  colors: [.black.opacity(0.24), .black.opacity(0.48)],
+                                  startPoint: .top,
+                                  endPoint: .bottom
+                              )
+                          )
+                          .ignoresSafeArea()
+                  }
+              }
+          
+              private var topChrome: some View {
+                  TimelineView(.periodic(from: .now, by: 60)) { context in
+                      VStack(spacing: 6) {
+                          Text(context.date, format: .dateTime.weekday(.wide).month().day())
+                              .font(.headline)
+                              .foregroundStyle(.white.opacity(0.88))
+          
+                          Text(context.date, format: .dateTime.hour().minute())
+                              .font(.system(size: 64, weight: .thin, design: .rounded))
+                              .foregroundStyle(.white)
+                              .onLongPressGesture(minimumDuration: 1.5) {
+                                  showPerformerControls = true
+                              }
+                      }
+                  }
+              }
+          
+              @ViewBuilder
+              private func keypadButton(for key: String) -> some View {
+                  if key.isEmpty {
+                      Color.clear
+                          .frame(width: 88, height: 88)
+                  } else {
+                      Button {
+                          if key == "delete" {
+                              appModel.removeLastDigit()
+                          } else if let character = key.first {
+                              appModel.appendDigit(character)
+                          }
+                      } label: {
+                          ZStack {
+                              Circle()
+                                  .fill(.thinMaterial.opacity(0.86))
+                              if key == "delete" {
+                                  Image(systemName: "delete.left")
+                                      .font(.system(size: 24, weight: .medium))
+                              } else {
+                                  Text(key)
+                                      .font(.system(size: 30, weight: .regular, design: .rounded))
+                              }
+                          }
+                          .frame(width: 88, height: 88)
+                      }
+                      .buttonStyle(.plain)
+                      .foregroundStyle(.white)
+                      .accessibilityIdentifier(key == "delete" ? "delete-button" : "digit-\(key)")
+                  }
+              }
+          }
+          
+          private struct ShakeEffect: GeometryEffect {
+              var amount: CGFloat = 12
+              var shakesPerUnit = 3
+              var animatableData: CGFloat
+          
+              func effectValue(size: CGSize) -> ProjectionTransform {
+                  ProjectionTransform(
+                      CGAffineTransform(
+                          translationX: amount * sin(animatableData * .pi * CGFloat(shakesPerUnit)),
+                          y: 0
+                      )
+                  )
+              }
+          }
+          EOF
+          
+          cat > MentalismApp/Views/FauxUnlockedHomeView.swift <<'EOF'
+          import SwiftUI
+          
+          struct FauxUnlockedHomeView: View {
+              @EnvironmentObject private var appModel: AppModel
+              @State private var showPerformerControls = false
+          
+              private let iconRows: [[(String, String, Color)]] = [
+                  [("sparkles", "Pulse", .orange), ("message.fill", "Echo", .green), ("camera.fill", "Lens", .blue), ("music.note", "Mix", .pink)],
+                  [("map.fill", "Route", .teal), ("calendar", "Plan", .red), ("note.text", "Memo", .yellow), ("waveform", "Audio", .indigo)],
+                  [("bolt.fill", "Flow", .mint), ("sun.max.fill", "Light", .cyan), ("timer", "Clock", .purple), ("heart.fill", "Focus", .red)],
+              ]
+          
+              var body: some View {
+                  ZStack {
+                      if let uiImage = appModel.wallpaperImage {
+                          Image(uiImage: uiImage)
+                              .resizable()
+                              .scaledToFill()
+                              .ignoresSafeArea()
+                      } else {
+                          LinearGradient(
+                              colors: [Color(red: 0.10, green: 0.18, blue: 0.28), Color(red: 0.18, green: 0.14, blue: 0.20)],
+                              startPoint: .topLeading,
+                              endPoint: .bottomTrailing
+                          )
+                          .ignoresSafeArea()
+                      }
+          
+                      Rectangle()
+                          .fill(.black.opacity(0.18))
+                          .ignoresSafeArea()
+          
+                      VStack(spacing: 18) {
+                          HStack {
+                              VStack(alignment: .leading, spacing: 4) {
+                                  Text("Unlocked")
+                                      .font(.headline)
+                                      .foregroundStyle(.white.opacity(0.84))
+                                  Text(Date(), format: .dateTime.hour().minute())
+                                      .font(.largeTitle.weight(.thin))
+                                      .foregroundStyle(.white)
+                              }
+                              Spacer()
+                          }
+          
+                          ForEach(iconRows.indices, id: \.self) { rowIndex in
+                              HStack(spacing: 20) {
+                                  ForEach(iconRows[rowIndex].indices, id: \.self) { iconIndex in
+                                      let icon = iconRows[rowIndex][iconIndex]
+                                      fauxIcon(symbol: icon.0, name: icon.1, color: icon.2)
+                                  }
+                              }
+                          }
+          
+                          Spacer()
+          
+                          HStack(spacing: 20) {
+                              fauxIcon(symbol: "phone.fill", name: "Call", color: .green)
+                              fauxIcon(symbol: "safari.fill", name: "Browse", color: .blue)
+                              fauxIcon(symbol: "camera.fill", name: "Snap", color: .gray)
+                              fauxIcon(symbol: "music.note", name: "Play", color: .pink)
+                          }
+                          .padding()
+                          .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 30, style: .continuous))
+          
+                          Button("Reset for Next Performance") {
+                              appModel.panicReset()
+                          }
+                          .buttonStyle(.borderedProminent)
+                          .tint(.orange)
+                      }
+                      .padding(24)
+                  }
+                  .onLongPressGesture(minimumDuration: 1.5) {
+                      showPerformerControls = true
+                  }
+                  .confirmationDialog("Performer Controls", isPresented: $showPerformerControls, titleVisibility: .visible) {
+                      Button("Reset to Setup", role: .destructive) {
+                          appModel.panicReset()
+                      }
+                  } message: {
+                      Text("Return to the setup screen for the next routine.")
+                  }
+              }
+          
+              private func fauxIcon(symbol: String, name: String, color: Color) -> some View {
+                  VStack(spacing: 8) {
+                      ZStack {
+                          RoundedRectangle(cornerRadius: 22, style: .continuous)
+                              .fill(color.gradient)
+                          Image(systemName: symbol)
+                              .font(.title2)
+                              .foregroundStyle(.white)
+                      }
+                      .frame(width: 72, height: 72)
+          
+                      Text(name)
+                          .font(.caption)
+                          .foregroundStyle(.white)
+                  }
+                  .frame(maxWidth: .infinity)
+              }
+          }
+          EOF
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate project
+        run: xcodegen generate
+
+      - name: Downgrade project objectVersion for Xcode 15.4
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          pbxproj = Path('MentalismApp.xcodeproj/project.pbxproj')
+          text = pbxproj.read_text()
+          text = text.replace('objectVersion = 77;', 'objectVersion = 60;')
+          pbxproj.write_text(text)
+          print('Patched objectVersion to 60')
+          PY
+
+      - name: Build iPhone app without signing
+        run: |
+          xcodebuild \
+            -project MentalismApp.xcodeproj \
+            -scheme MentalismApp \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package unsigned IPA
+        run: bash scripts/package_unsigned_ipa.sh MentalismApp DerivedData/Build/Products/Release-iphoneos/MentalismApp.app artifacts
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mentalismapp-unsigned-ipa
+          path: |
+            artifacts/MentalismApp-unsigned.ipa
+            DerivedData/Build/Products/Release-iphoneos/MentalismApp.app
